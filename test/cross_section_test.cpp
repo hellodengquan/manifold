@@ -3140,3 +3140,363 @@ TEST(CrossSection, WindingSweepCrossingsAndRoundOffsets) {
   EXPECT_EQ(mesh.Status(), Manifold::Error::NoError);
   EXPECT_NEAR(mesh.Volume(), eroded.Area() * 2.0, 1e-5);
 }
+
+// ===========================================================================
+// Offset -> Extrude consistency: hole semantics, side-wall winding and volume.
+//
+// CrossSection storage is normal-oriented (CCW outer, CW holes). Offset keeps
+// that convention and any surviving ring keeps its role; only rings whose
+// feature is narrower than twice the offset distance are erased. Extrude then
+// turns outer rings into solid caps and CW rings into cavities, so the prism's
+// genus, winding numbers and volume must all follow the section's contour
+// bookkeeping. The tests below pin that contract, including the three ways a
+// section can end up empty, which must remain distinguishable:
+//   * an empty section (zero contours),
+//   * an invalid section (a contour carrying non-finite vertices),
+//   * a valid section whose narrow feature the offset erases.
+// All geometry is built inline - no external model files are needed.
+// ===========================================================================
+namespace {
+
+// Independent shoelace oracle (not the engine's own TotalSignedArea): >0 means
+// a CCW outer ring, <0 a CW hole ring.
+double RingSignedArea(const SimplePolygon& ring) {
+  double sum = 0.0;
+  for (size_t i = 0; i < ring.size(); ++i) {
+    const vec2& a = ring[i];
+    const vec2& b = ring[(i + 1) % ring.size()];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return 0.5 * sum;
+}
+
+// A regularized section has one CCW outer per component; every other ring is a
+// CW hole.
+void ExpectCanonicalWinding(const Polygons& polys) {
+  int outers = 0;
+  for (const SimplePolygon& ring : polys) {
+    ASSERT_GE(ring.size(), 3u);
+    if (RingSignedArea(ring) > 0.0) {
+      ++outers;
+    } else {
+      EXPECT_LT(RingSignedArea(ring), 0.0) << "a zero-area ring is neither a "
+                                              "wound outer nor a wound hole";
+    }
+  }
+  EXPECT_GE(outers, 1) << "every non-empty section needs a CCW outer ring";
+}
+
+int CountHoleRings(const Polygons& polys) {
+  int holes = 0;
+  for (const SimplePolygon& ring : polys) {
+    if (RingSignedArea(ring) < 0.0) ++holes;
+  }
+  return holes;
+}
+
+// A 20x20 plate centred on the origin with a centred 4x4 square hole: area
+// 384, two canonical contours (CCW outer + CW hole). Built with a boolean
+// subtract, which preserves the inner ring below the raw-contour
+// constructor's epsilon band.
+CrossSection PlateWithHole() {
+  CrossSection cs = CrossSection::Square({20.0, 20.0}, true) -
+                    CrossSection::Square({4.0, 4.0}, true);
+  EXPECT_EQ(cs.NumContour(), 2u);
+  EXPECT_NEAR(cs.Area(), 384.0, 1e-9);
+  return cs;
+}
+
+// A 10x10 plate with a centred 2x4 hole (area 92, outer + one CW hole). The
+// hole's 2-unit width is exactly twice the 1-unit dilation that erases it.
+CrossSection NarrowHolePlate() {
+  CrossSection cs = CrossSection::Square({10.0, 10.0}, true) -
+                    CrossSection::Square({2.0, 4.0}, true);
+  EXPECT_EQ(cs.NumContour(), 2u);
+  EXPECT_NEAR(cs.Area(), 92.0, 1e-9);
+  return cs;
+}
+
+// A 10x10 plate with two 3x8 holes side by side, leaving a 2-unit-wide solid
+// channel down the middle (one CCW outer + two CW holes, area 52).
+CrossSection NarrowChannelPlate() {
+  CrossSection plate = CrossSection::Square({10.0, 10.0}, true);
+  const CrossSection leftHole =
+      CrossSection::Square({3.0, 8.0}, true).Translate({-2.5, 0.0});
+  const CrossSection rightHole =
+      CrossSection::Square({3.0, 8.0}, true).Translate({2.5, 0.0});
+  CrossSection cs = plate - leftHole - rightHole;
+  EXPECT_EQ(cs.NumContour(), 3u);
+  EXPECT_NEAR(cs.Area(), 52.0, 1e-9);
+  return cs;
+}
+
+}  // namespace
+
+// The three empty outcomes must be distinguishable, never silently conflated:
+// an empty section carries no contours, an invalid section carries a contour
+// with a non-finite vertex (and Extrude rejects it), and a valid section only
+// becomes empty after an offset erases a narrow feature.
+TEST(CrossSection, OffsetEmptyInvalidAndErasedAreDistinguishable) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  // (1) Empty: a section with no contours.
+  const CrossSection empty;
+  EXPECT_TRUE(empty.IsEmpty());
+  EXPECT_EQ(empty.NumContour(), 0u);
+  EXPECT_EQ(empty.NumVert(), 0u);
+  EXPECT_EQ(empty.Area(), 0.0);
+  EXPECT_TRUE(empty.Bounds().IsEmpty());
+  EXPECT_TRUE(empty.ToPolygons().empty());
+  // Offsetting an empty section stays empty rather than manufacturing loops.
+  EXPECT_TRUE(empty.Offset(5.0, CrossSection::JoinType::Miter).IsEmpty());
+  // Extrude has no usable contour, so it reports an invalid construction.
+  EXPECT_EQ(Manifold::Extrude(empty.ToPolygons(), 2.0).Status(),
+            Manifold::Error::InvalidConstruction);
+
+  // (2) Invalid: a well-formed four-point contour carrying a non-finite
+  // vertex. The constructor regularizes it away to an empty section, but its
+  // non-finiteness remains observable through Extrude on the raw contour and
+  // through Offset, which must refuse the input outright.
+  const SimplePolygon bad = {{0, 0}, {1, 0}, {nan, 1}, {0, 1}};
+  const CrossSection invalid(bad);
+  EXPECT_TRUE(invalid.IsEmpty());
+  EXPECT_EQ(invalid.ToPolygons().size(), 0u);
+  EXPECT_EQ(Manifold::Extrude(Polygons{bad}, 2.0).Status(),
+            Manifold::Error::InvalidConstruction);
+  const CrossSection square = CrossSection::Square({10, 10}, true);
+  EXPECT_TRUE(square.Offset(nan, CrossSection::JoinType::Round).IsEmpty());
+  EXPECT_TRUE(square.Offset(inf, CrossSection::JoinType::Miter).IsEmpty());
+
+  // (3) Erased by offset: a genuinely valid thin bar. It starts non-empty and
+  // a single unit of inset erases it, since the inset distance reaches half
+  // its 1-unit width. This is a geometric collapse of valid finite input,
+  // distinct from (1) (there was a contour) and from (2) (every vertex was
+  // finite).
+  const CrossSection thin = CrossSection::Square({10.0, 1.0}, true);
+  ASSERT_FALSE(thin.IsEmpty());
+  ASSERT_NEAR(thin.Area(), 10.0, 1e-9);
+  const CrossSection erased = thin.Offset(-1.0, CrossSection::JoinType::Miter);
+  EXPECT_TRUE(erased.IsEmpty());
+  EXPECT_EQ(erased.NumContour(), 0u);
+  EXPECT_EQ(erased.ToPolygons().size(), 0u);
+  EXPECT_EQ(Manifold::Extrude(erased.ToPolygons(), 2.0).Status(),
+            Manifold::Error::InvalidConstruction);
+
+  // The same distinction for a narrow solid *channel* between two holes: a
+  // small inset merely thins it (both holes survive), a larger inset merges
+  // the holes into one ring, and a full-unit inset erases the remaining frame
+  // entirely. Every intermediate result stays a valid non-empty section, so
+  // the final collapse differs from the empty and invalid outcomes above.
+  const CrossSection channel = NarrowChannelPlate();
+  const CrossSection thinned =
+      channel.Offset(-0.25, CrossSection::JoinType::Miter);
+  ASSERT_FALSE(thinned.IsEmpty());
+  EXPECT_EQ(thinned.NumContour(), 3u);
+  EXPECT_GT(thinned.Area(), 0.0);
+  EXPECT_LT(thinned.Area(), channel.Area());
+  const CrossSection gone =
+      channel.Offset(-1.0, CrossSection::JoinType::Miter);
+  EXPECT_TRUE(gone.IsEmpty());
+  EXPECT_EQ(gone.NumContour(), 0u);
+}
+
+// A surviving inset must keep the hole/outer roles and the winding of every
+// side wall: the outer stays CCW and the hole stays CW.
+TEST(CrossSection, OffsetInsetPreservesHoleWinding) {
+  const CrossSection holed = PlateWithHole();
+  const Polygons before = holed.ToPolygons();
+  ASSERT_EQ(before.size(), 2u);
+  ExpectCanonicalWinding(before);
+  EXPECT_EQ(CountHoleRings(before), 1);
+
+  const CrossSection inset =
+      holed.Offset(-1.0, CrossSection::JoinType::Miter);
+  ASSERT_FALSE(inset.IsEmpty());
+  ASSERT_EQ(inset.NumContour(), 2u)
+      << "the 4-wide hole survives a 1-unit inset";
+  const Polygons after = inset.ToPolygons();
+  ExpectCanonicalWinding(after);
+  EXPECT_EQ(CountHoleRings(after), 1)
+      << "the hole ring kept its CW winding through the inset";
+
+  // An inset contracts the outer to 18x18 and, conversely, expands the hole
+  // to 6x6: solid area 324 - 36 = 288, strictly less than the input.
+  EXPECT_NEAR(inset.Area(), 18.0 * 18.0 - 6.0 * 6.0, 1e-9);
+  EXPECT_LT(inset.Area(), holed.Area());
+}
+
+// The dual direction: an outset expands the outer while contracting the hole,
+// again without swapping either ring's orientation.
+TEST(CrossSection, OffsetOutsetPreservesHoleWinding) {
+  const CrossSection holed = PlateWithHole();
+  const CrossSection outset =
+      holed.Offset(1.0, CrossSection::JoinType::Miter);
+  ASSERT_FALSE(outset.IsEmpty());
+  ASSERT_EQ(outset.NumContour(), 2u)
+      << "the 4-wide hole survives a 1-unit dilation";
+  const Polygons after = outset.ToPolygons();
+  ExpectCanonicalWinding(after);
+  EXPECT_EQ(CountHoleRings(after), 1);
+  // Outer grows to 22x22 while the hole shrinks to 2x2: 484 - 4.
+  EXPECT_NEAR(outset.Area(), 22.0 * 22.0 - 2.0 * 2.0, 1e-9);
+  EXPECT_GT(outset.Area(), holed.Area());
+}
+
+// A hole narrower than twice the dilation must be erased (filled in), turning
+// the two-contour section into a single CCW outer - the 2D analogue of the
+// hole closing, and distinct from both an empty and an invalid section.
+TEST(CrossSection, OffsetErasesNarrowHoleAndFillsSolid) {
+  const CrossSection holed = NarrowHolePlate();
+  ASSERT_EQ(CountHoleRings(holed.ToPolygons()), 1);
+
+  // Just below the threshold the hole still exists; delta = 1 reaches half the
+  // 2-unit hole width, so the hole ring collapses on the next offset.
+  const CrossSection surviving =
+      holed.Offset(0.9, CrossSection::JoinType::Miter);
+  ASSERT_EQ(surviving.NumContour(), 2u);
+  EXPECT_EQ(CountHoleRings(surviving.ToPolygons()), 1);
+
+  const CrossSection filled =
+      holed.Offset(1.0, CrossSection::JoinType::Miter);
+  EXPECT_FALSE(filled.IsEmpty())
+      << "the outer survives; only the narrow hole is erased";
+  EXPECT_EQ(filled.NumContour(), 1u) << "the hole is filled in";
+  const Polygons after = filled.ToPolygons();
+  ExpectCanonicalWinding(after);
+  EXPECT_EQ(CountHoleRings(after), 0);
+  // The filled body is larger than the holed input.
+  EXPECT_GT(filled.Area(), holed.Area());
+}
+
+// A narrow solid channel between two holes degrades in distinct, observable
+// stages under an inset: both holes survive while the wall is wide enough,
+// they merge into one hole once the wall is consumed, and the remaining outer
+// frame collapses to empty when the inset reaches the frame's half-width.
+TEST(CrossSection, OffsetErasesNarrowChannel) {
+  const CrossSection channel = NarrowChannelPlate();
+  const Polygons before = channel.ToPolygons();
+  ExpectCanonicalWinding(before);
+  EXPECT_EQ(CountHoleRings(before), 2);
+
+  // Stage 1: a 0.25 inset keeps one outer and both CW hole rings but shrinks
+  // the solid.
+  const CrossSection thinned =
+      channel.Offset(-0.25, CrossSection::JoinType::Miter);
+  ASSERT_FALSE(thinned.IsEmpty());
+  ASSERT_EQ(thinned.NumContour(), 3u);
+  const Polygons thinPolys = thinned.ToPolygons();
+  ExpectCanonicalWinding(thinPolys);
+  EXPECT_EQ(CountHoleRings(thinPolys), 2);
+  EXPECT_LT(thinned.Area(), channel.Area());
+
+  // Stage 2: half the 2-unit channel width consumes the separating wall, so
+  // the two holes merge into a single CW ring (the section is still non-empty).
+  const CrossSection merged =
+      channel.Offset(-0.5, CrossSection::JoinType::Miter);
+  ASSERT_FALSE(merged.IsEmpty());
+  ASSERT_EQ(merged.NumContour(), 1u);
+  ExpectCanonicalWinding(merged.ToPolygons());
+
+  // Stage 3: insetting by the full frame width removes even the outer ring,
+  // leaving a genuinely empty section - distinct from stages 1 and 2.
+  const CrossSection gone =
+      channel.Offset(-1.0, CrossSection::JoinType::Miter);
+  EXPECT_TRUE(gone.IsEmpty());
+  EXPECT_EQ(gone.NumContour(), 0u);
+}
+
+// Volume must follow the section area: an offset section extruded to height h
+// has volume h * area, the ring count maps to genus, and the solid's winding
+// numbers agree with where the holes actually are.
+TEST(CrossSection, OffsetExtrudeKeepsVolumeHoleAndWinding) {
+  constexpr double height = 3.0;
+  const CrossSection holed = PlateWithHole();
+  const CrossSection inset =
+      holed.Offset(-1.0, CrossSection::JoinType::Miter);
+  ASSERT_EQ(inset.NumContour(), 2u);
+
+  const Manifold solid = Manifold::Extrude(inset.ToPolygons(), height);
+  ASSERT_EQ(solid.Status(), Manifold::Error::NoError);
+  // One through-hole per extruded CW ring => genus 1.
+  EXPECT_EQ(solid.Genus(), 1);
+  EXPECT_NEAR(solid.Volume(), inset.Area() * height, 1e-6);
+
+  // 3D winding: solid material is 1, the through-cavity is 0, outside is 0.
+  const std::vector<vec3> probes = {
+      {0.0, 0.0, height * 0.5},     // inside the (expanded) hole: cavity
+      {-8.0, 0.0, height * 0.5},    // inside the inset wall
+      {0.0, 8.0, height * 0.5},     // inside the inset wall
+      {-20.0, -20.0, height * 0.5}  // well outside
+  };
+  const std::vector<int> winding = solid.WindingNumber(probes);
+  EXPECT_EQ(winding[0], 0) << "cavity of the offset hole is not solid";
+  EXPECT_EQ(winding[1], 1);
+  EXPECT_EQ(winding[2], 1);
+  EXPECT_EQ(winding[3], 0);
+
+  // Slicing the prism midway returns the offset section, so the cavity runs
+  // the full height rather than being capped halfway.
+  const CrossSection middle(solid.Slice(height * 0.5));
+  EXPECT_EQ(middle.NumContour(), inset.NumContour());
+  EXPECT_NEAR(middle.Area(), inset.Area(), 1e-6);
+  EXPECT_NEAR((middle - inset).Area(), 0.0, 1e-6);
+  EXPECT_NEAR((inset - middle).Area(), 0.0, 1e-6);
+}
+
+// Erasing the hole with an outset before extruding yields a solid of genus 0
+// whose volume is the filled section area times the height.
+TEST(CrossSection, OffsetFilledHoleExtrudesToGenusZero) {
+  const CrossSection filled =
+      NarrowHolePlate().Offset(1.0, CrossSection::JoinType::Miter);
+  ASSERT_EQ(filled.NumContour(), 1u);
+  ASSERT_EQ(CountHoleRings(filled.ToPolygons()), 0);
+
+  constexpr double height = 4.0;
+  const Manifold solid = Manifold::Extrude(filled.ToPolygons(), height);
+  ASSERT_EQ(solid.Status(), Manifold::Error::NoError);
+  EXPECT_EQ(solid.Genus(), 0) << "no through-hole survives the filled hole";
+  EXPECT_NEAR(solid.Volume(), filled.Area() * height, 1e-6);
+
+  const std::vector<int> winding =
+      solid.WindingNumber({{0.0, 0.0, height * 0.5},
+                           {0.0, 4.0, height * 0.5},
+                           {-4.0, -4.0, height * 0.5}});
+  for (int w : winding) EXPECT_EQ(w, 1) << "filled region must be solid";
+}
+
+// The winding/hole contract must hold for every join type, not just Miter,
+// and an offset round-trip must return to the original contour bookkeeping.
+TEST(CrossSection, OffsetWindingAcrossJoinTypesAndRoundTrip) {
+  const CrossSection holed = PlateWithHole();
+  for (const auto jt : {CrossSection::JoinType::Round,
+                        CrossSection::JoinType::Miter,
+                        CrossSection::JoinType::Square,
+                        CrossSection::JoinType::Bevel}) {
+    SCOPED_TRACE(static_cast<int>(jt));
+    const CrossSection inset = holed.Offset(-1.0, jt, 2.0, 32);
+    ASSERT_FALSE(inset.IsEmpty());
+    ASSERT_EQ(inset.NumContour(), 2u);
+    const Polygons polys = inset.ToPolygons();
+    ExpectCanonicalWinding(polys);
+    EXPECT_EQ(CountHoleRings(polys), 1);
+    EXPECT_NEAR(inset.Area(),
+                Manifold::Extrude(inset.ToPolygons(), 1.0).Volume(), 1e-6);
+
+    // Grow the inset back out: both rings return and the solid is again genus
+    // 1. Miter is exact for axis-aligned squares; the faceted joins introduce
+    // small area differences, so topology and winding are pinned and area is
+    // checked against the round-trip's own value rather than the original.
+    const CrossSection restored = inset.Offset(1.0, jt, 2.0, 32);
+    ASSERT_EQ(restored.NumContour(), 2u)
+        << "the hole must reappear with its CW winding after the reverse offset";
+    ExpectCanonicalWinding(restored.ToPolygons());
+    EXPECT_EQ(CountHoleRings(restored.ToPolygons()), 1);
+    const Manifold restoredSolid =
+        Manifold::Extrude(restored.ToPolygons(), 1.0);
+    EXPECT_EQ(restoredSolid.Status(), Manifold::Error::NoError);
+    EXPECT_EQ(restoredSolid.Genus(), 1);
+    EXPECT_NEAR(restoredSolid.Volume(), restored.Area(), 1e-6);
+    EXPECT_GT(restored.Area(), 0.0);
+  }
+}
