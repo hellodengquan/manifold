@@ -29,6 +29,7 @@ set(
   context_test.cpp
   measurement_test.cpp
   boolean_test.cpp
+  boolean_properties_test.cpp
   sdf_test.cpp
   smooth_test.cpp
   hull_test.cpp
